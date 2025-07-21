@@ -36,9 +36,9 @@ def get_max_min_xyz(raw_gcode):
         max_x = 0
         max_y = 0
         max_z = 0
-        min_x = 0
-        min_y = 0
-        min_z = 0
+        min_x = 1000
+        min_y = 1000
+        min_z = 1000
         for line in raw_gcode:
             gcode_line = Line(line)
             for word in gcode_line.block.words:
@@ -52,9 +52,9 @@ def get_max_min_xyz(raw_gcode):
                     max_z = max(max_z, word.value)
                     min_z = min(min_z, word.value)
         return {
-            "Middle": str(((max_x + min_x) / 2, (max_y + min_y) / 2, (max_z + min_z) / 2)),
-            "Max": str((max_x, max_y, max_z)),
-            "Min": str((min_x, min_y, min_z))
+            "mid": {'x':(max_x + min_x) / 2, 'y':(max_y + min_y) / 2, 'z':(max_z + min_z) / 2},
+            "max": {'x': max_x, 'y': max_y, 'z': max_z},
+            "min": {'x': min_x, 'y': min_y, 'z': min_z}
         }
 
 def get_hash(content):
