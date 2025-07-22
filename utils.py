@@ -36,25 +36,40 @@ def get_max_min_xyz(raw_gcode):
         max_x = 0
         max_y = 0
         max_z = 0
+        max_i = 0
+        max_j = 0
+        max_r = 0
         min_x = 1000
         min_y = 1000
         min_z = 1000
+        min_i = 1000
+        min_j = 1000
+        min_r = 1000
         for line in raw_gcode:
             gcode_line = Line(line)
             for word in gcode_line.block.words:
                 if word.letter == "X":
                     max_x = max(max_x, word.value)
                     min_x = min(min_x, word.value)
-                if word.letter == "Y":
+                elif word.letter == "Y":
                     max_y = max(max_y, word.value)
                     min_y = min(min_y, word.value)
-                if word.letter == "Z":
+                elif word.letter == "Z":
                     max_z = max(max_z, word.value)
                     min_z = min(min_z, word.value)
+                elif word.letter == "I":
+                    max_i = max(max_i, word.value)
+                    min_i = min(min_i, word.value)
+                elif word.letter == "J":
+                    max_j = max(max_j, word.value)
+                    min_j = min(min_j, word.value)
+                elif word.letter == "R":
+                    max_r = max(max_r, word.value)
+                    min_r = min(min_r, word.value)
         return {
             "mid": {'x':(max_x + min_x) / 2, 'y':(max_y + min_y) / 2, 'z':(max_z + min_z) / 2},
-            "max": {'x': max_x, 'y': max_y, 'z': max_z},
-            "min": {'x': min_x, 'y': min_y, 'z': min_z}
+            "max": {'x': max_x, 'y': max_y, 'z': max_z, 'i': max_i, 'j': max_j},
+            "min": {'x': min_x, 'y': min_y, 'z': min_z, 'i': min_i, 'j': min_j}
         }
 
 def get_hash(content):
