@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QTransform,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -44,13 +46,25 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from utils import MACHINE_TRAVEL_MM, alignment_box, get_gcode_info, get_toolpath, scale_gcode, shift_gcode
+from utils import (
+    MACHINE_TRAVEL_MM,
+    alignment_box,
+    apply_speeds,
+    get_gcode_info,
+    get_speed_info,
+    get_toolpath,
+    scale_gcode,
+    shift_gcode,
+)
 
 APP_NAME = "G-code Shifter"
 FILE_FILTER = "G-code files (*.nc *.gcode *.ngc *.tap *.gc *.txt);;All files (*)"
@@ -437,6 +451,168 @@ class AnchorPicker(QWidget):
         return f"{V_NAMES[self._v]}-{H_NAMES[self._h]}"
 
 
+def num(v):
+    """Compact number: 12000, 0.5, 1,250.25."""
+    s = f"{v:,.3f}".rstrip("0").rstrip(".")
+    return "0" if s in ("", "-0") else s
+
+
+def duration(minutes):
+    sec = round(minutes * 60)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
+
+
+class _NewValueDelegate(QStyledItemDelegate):
+    def __init__(self, parent, minimum):
+        super().__init__(parent)
+        self.minimum = minimum
+
+    def createEditor(self, parent, option, index):
+        e = QDoubleSpinBox(parent)
+        e.setRange(self.minimum, 1e6)
+        e.setDecimals(3)
+        e.setFrame(False)
+        return e
+
+
+class ValueTable(QWidget):
+    """Every distinct value of one parameter with its usage and an editable new value.
+
+    Scales from one value (a typical CNC file) to hundreds (a grayscale laser
+    raster): the table scrolls, and "All values" rescales every row at once.
+    """
+
+    changed = Signal()
+    MAX_VISIBLE_ROWS = 6
+
+    def __init__(self, minimum):
+        super().__init__()
+        self.minimum = minimum  # smallest allowed new value (feeds > 0, S >= 0)
+        self._rows = []
+        self._new = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.table = QTableWidget(0, 3)
+        self.table.verticalHeader().hide()
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.table.setItemDelegateForColumn(2, _NewValueDelegate(self.table, max(minimum, 0.0)))
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.itemChanged.connect(self._item_changed)
+        lay.addWidget(self.table)
+
+        self.pct = spin(1, 1000, 5, 0, 100)
+        self.pct.setSuffix(" %")
+        self.pct.setMinimumWidth(90)
+        self.pct.setToolTip("Set every row to this percentage of its current value.")
+        self.pct.valueChanged.connect(self._pct_changed)
+        self.b_reset = QToolButton()
+        self.b_reset.setText("↺ Reset")
+        self.b_reset.setToolTip("Undo the edits in this table")
+        self.b_reset.clicked.connect(self.reset)
+        self.bulk = form_row("All values:", self.pct, self.b_reset)
+        lay.addWidget(self.bulk)
+        self.empty = label("", "muted", wrap=True)
+        lay.addWidget(self.empty)
+
+    def set_headers(self, now, new):
+        self.table.setHorizontalHeaderLabels([now, "Used by", new])
+
+    def set_rows(self, rows, total_length, empty_text):
+        """rows: dicts from utils.get_speed_info. Keeps edits if the values are the same."""
+        keys = [r["value"] for r in rows]
+        if keys != [r["value"] for r in self._rows]:
+            self._new = {k: k for k in keys}
+            self.pct.blockSignals(True)
+            self.pct.setValue(100)
+            self.pct.blockSignals(False)
+        self._rows = rows
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            share = 100 * r["length"] / total_length if total_length else 0
+            used = f"{r['moves']:,} moves · {share:.0f}%"
+            if r.get("plunges", 0) * 2 > r["moves"]:
+                used += " · ↓ plunge"
+            for col, text in ((0, num(r["value"]).replace(",", "")), (1, used)):
+                it = QTableWidgetItem(text)
+                it.setFlags(Qt.ItemIsEnabled)
+                self.table.setItem(i, col, it)
+            it = QTableWidgetItem()
+            it.setData(Qt.EditRole, float(self._new[r["value"]]))
+            it.setToolTip("Double-click to type a new value")
+            self.table.setItem(i, 2, it)
+        self.table.blockSignals(False)
+        self._restyle()
+        has = bool(rows)
+        self.table.setVisible(has)
+        self.bulk.setVisible(has)
+        self.empty.setVisible(not has)
+        self.empty.setText(empty_text)
+        rh = self.table.verticalHeader().defaultSectionSize()
+        visible = min(len(rows), self.MAX_VISIBLE_ROWS)
+        self.table.setFixedHeight(self.table.horizontalHeader().sizeHint().height() + rh * visible + 4)
+
+    def _restyle(self):
+        self.table.blockSignals(True)
+        for i, r in enumerate(self._rows):
+            it = self.table.item(i, 2)
+            edited = abs(self._new[r["value"]] - r["value"]) > 1e-9
+            f = it.font()
+            f.setBold(edited)
+            it.setFont(f)
+            it.setForeground(QColor(self.palette().color(QPalette.Highlight)) if edited else QColor(self.palette().color(QPalette.Text)))
+        self.table.blockSignals(False)
+
+    def _item_changed(self, it):
+        if it.column() != 2:
+            return
+        key = self._rows[it.row()]["value"]
+        try:
+            v = float(it.data(Qt.EditRole))
+        except (TypeError, ValueError):
+            v = key
+        if not math.isfinite(v) or v < self.minimum or (self.minimum > 0 and v <= 0):
+            v = key
+        self._new[key] = v
+        self._restyle()
+        self.changed.emit()
+
+    def _pct_changed(self, pct):
+        for r in self._rows:
+            self._new[r["value"]] = round(r["value"] * pct / 100.0, 3) or (r["value"] if self.minimum > 0 else 0.0)
+        self._sync()
+
+    def reset(self):
+        self._new = {r["value"]: r["value"] for r in self._rows}
+        self.pct.blockSignals(True)
+        self.pct.setValue(100)
+        self.pct.blockSignals(False)
+        self._sync()
+
+    def _sync(self):
+        self.table.blockSignals(True)
+        for i, r in enumerate(self._rows):
+            self.table.item(i, 2).setData(Qt.EditRole, float(self._new[r["value"]]))
+        self.table.blockSignals(False)
+        self._restyle()
+        self.changed.emit()
+
+    def mapping(self):
+        return {r["value"]: self._new[r["value"]] for r in self._rows if abs(self._new[r["value"]] - r["value"]) > 1e-9}
+
+    def minutes(self, new=True):
+        """Time for these moves at the current (or new) feeds, in minutes."""
+        return sum(r["length"] / (self._new[r["value"]] if new else r["value"]) for r in self._rows if r["value"] > 0)
+
+
 def spin(minimum=-99999.0, maximum=99999.0, step=1.0, decimals=3, value=0.0):
     s = QDoubleSpinBox()
     s.setRange(minimum, maximum)
@@ -570,7 +746,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_position_tab(), "Position")
         self.tabs.addTab(self._build_scale_tab(), "Scale")
-        self.tabs.addTab(self._build_z_tab(), "Z · depth/focus")
+        self.tabs.addTab(self._build_z_tab(), "Z depth")
+        self.tabs.addTab(self._build_speed_tab(), "Speed && power")
         self.tabs.currentChanged.connect(self.update_overlay)
         sl.addWidget(self.tabs)
 
@@ -786,7 +963,8 @@ class MainWindow(QMainWindow):
         self.b_scale.clicked.connect(self.scale)
         lay.addWidget(self.b_scale)
         note = label(
-            "Scales X/Y and arcs. Z, feed rate and spindle speed / laser power stay the same.\n"
+            "Scales X/Y and arcs. Z, feed rate and spindle speed / laser power stay the same "
+            "(change those in the Speed & power tab).\n"
             "CNC: the bit doesn't scale, so offset paths come out slightly off size.\n"
             "Laser images: line spacing scales too (bigger = lighter, smaller = darker).",
             "muted",
@@ -836,7 +1014,205 @@ class MainWindow(QMainWindow):
             sig.connect(lambda *_: self._update_z())
         return w
 
+    def _build_speed_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(8)
+        self.sp_blocked = label("", "banner-info", wrap=True)
+        lay.addWidget(self.sp_blocked)
+
+        self.sp_cnc = QRadioButton("CNC spindle")
+        self.sp_laser = QRadioButton("Laser")
+        self.sp_cnc.setChecked(True)
+        tg = QButtonGroup(self)
+        tg.addButton(self.sp_cnc)
+        tg.addButton(self.sp_laser)
+        self.sp_tool_hint = label("", "muted")
+        lay.addWidget(form_row("Tool:", self.sp_cnc, self.sp_laser, self.sp_tool_hint))
+
+        # Working
+        self.sp_work_title = self._section(lay, "Feed while working")
+        lay.addWidget(label("Moves that cut or burn: spindle running / laser on.", "muted", wrap=True))
+        self.t_work = ValueTable(minimum=0.001)
+        lay.addWidget(self.t_work)
+
+        # Not working
+        self._section(lay, "Speed while not working")
+        self.sp_idle_hint = label("", "muted", wrap=True)
+        lay.addWidget(self.sp_idle_hint)
+        self.t_idle = ValueTable(minimum=0.001)
+        lay.addWidget(self.t_idle)
+        self.sp_rapid_info = label("", wrap=True)
+        self.sp_rapid_info.setTextFormat(Qt.RichText)
+        lay.addWidget(self.sp_rapid_info)
+        self.sp_rapid = QCheckBox("Limit rapid moves to")
+        self.sp_rapid.setToolTip(
+            "GRBL always runs G0 at full speed. This rewrites G0 as G1 at the chosen feed.\n"
+            "Laser: those moves get S0 so the beam stays off. CNC: the spindle keeps running."
+        )
+        self.sp_rapid_f = spin(1, 100000, 100, 0, 3000)
+        self.sp_rapid_row = form_row(self.sp_rapid, self.sp_rapid_f)
+        lay.addWidget(self.sp_rapid_row)
+
+        # Power
+        self.sp_power_title = self._section(lay, "Spindle speed (S)")
+        self.sp_power_hint = label("", "muted", wrap=True)
+        lay.addWidget(self.sp_power_hint)
+        self.t_power = ValueTable(minimum=0.0)
+        lay.addWidget(self.t_power)
+
+        self.sp_summary = label("", wrap=True)
+        self.sp_summary.setObjectName("card")
+        self.sp_summary.setTextFormat(Qt.RichText)
+        self.sp_summary.setContentsMargins(10, 8, 10, 8)
+        lay.addWidget(self.sp_summary)
+        self.sp_warn = label("", "banner-warning", wrap=True)
+        lay.addWidget(self.sp_warn)
+        self.b_speed = primary_button("Apply speed && power")
+        self.b_speed.clicked.connect(self.apply_speed)
+        lay.addWidget(self.b_speed)
+        lay.addStretch(1)
+
+        for t in (self.t_work, self.t_idle, self.t_power):
+            t.changed.connect(self._update_speed)
+        self.sp_rapid.toggled.connect(self._update_speed)
+        self.sp_rapid_f.valueChanged.connect(self._update_speed)
+        tg.buttonToggled.connect(lambda _b, checked: checked and self._tool_changed())
+        self._tool_user_set = False
+        return w
+
+    def _tool_changed(self):
+        self._tool_user_set = True
+        self._refresh_speed()
+
+    def _refresh_speed(self):
+        """Fill the Speed & power tab from the current output."""
+        if not self.loaded:
+            return
+        si = self.speed_info(self.output)
+        u = self.info(self.output)["units"]
+        fu = f"{u}/min"
+        laser = self.sp_laser.isChecked()
+        self.sp_tool_hint.setText("" if self._tool_user_set else "(detected)")
+
+        blocked = si["inverse_time"]
+        self.sp_blocked.setVisible(blocked)
+        self.sp_blocked.setText("This file uses inverse-time feed (G93), so feed rates can't be edited here.")
+        for wdg in (self.t_work, self.t_idle, self.sp_rapid_row):
+            wdg.setEnabled(not blocked)
+
+        total = sum(r["length"] for r in si["work"]) or 1
+        self.t_work.set_headers(f"Now ({fu})", "New")
+        self.t_work.set_rows(si["work"], total, "No cutting moves with a feed rate.")
+
+        total = sum(r["length"] for r in si["idle"]) or 1
+        self.t_idle.set_headers(f"Now ({fu})", "New")
+        self.sp_idle_hint.setText(
+            "Feed moves with the laser off or S0 (e.g. overscan at the end of each line)."
+            if laser else "Feed moves with the spindle stopped (G1/G2/G3 after M5)."
+        )
+        self.t_idle.set_rows(si["idle"], total, "None in this file — all travel uses rapid moves (below).")
+
+        rp = si["rapids"]
+        self.sp_rapid_row.setVisible(rp["moves"] > 0)
+        if rp["moves"]:
+            self.sp_rapid_info.setText(
+                f"<b>Rapid moves (G0):</b> {rp['moves']:,} moves, {num(rp['length'])} {u}.<br>"
+                f"<span style='color:{self.t['muted']}'>These always run at the machine's maximum rate "
+                f"(GRBL $110/$111). The file can't slow them down unless they become G1 moves.</span>"
+            )
+        else:
+            self.sp_rapid_info.setText(f"<span style='color:{self.t['muted']}'>No rapid (G0) moves.</span>")
+        self.sp_rapid_f.setSuffix(f" {fu}")
+
+        if laser:
+            self.sp_power_title.setText("LASER POWER (S)")
+            self.sp_power_hint.setText("Power while burning. 100% = GRBL's $30 (1000 by default). S0 stays off.")
+            self.t_power.set_headers("Now (S)", "New")
+        else:
+            self.sp_power_title.setText("SPINDLE SPEED (S)")
+            self.sp_power_hint.setText("Spindle speed while cutting (RPM, up to GRBL's $30).")
+            self.t_power.set_headers("Now (RPM)", "New")
+        total = sum(r["length"] for r in si["power"]) or 1
+        self.t_power.set_rows(si["power"], total, "No S values on the cutting moves.")
+        self._update_speed()
+
+    def _speed_request(self):
+        rapid = self.sp_rapid_f.value() if (self.sp_rapid.isChecked() and self.sp_rapid_row.isVisible()) else None
+        return self.t_work.mapping(), self.t_idle.mapping(), self.t_power.mapping(), rapid
+
+    def _update_speed(self, *_):
+        if not self.loaded:
+            return
+        si = self.speed_info(self.output)
+        work, idle, power, rapid = self._speed_request()
+        self.sp_rapid_f.setEnabled(self.sp_rapid.isChecked())
+        pending = bool(work or idle or power or rapid is not None)
+        self.b_speed.setEnabled(pending)
+
+        # Estimated time of the moves we know the speed of.
+        before = self.t_work.minutes(False) + self.t_idle.minutes(False)
+        after = self.t_work.minutes() + self.t_idle.minutes()
+        rp = si["rapids"]
+        if rapid is not None:
+            after += rp["length"] / rapid
+        muted = self.t["muted"]
+        if before > 0:
+            line = f"<b>Feed-move time ≈ {duration(before)}</b>"
+            if abs(after - before) > 1 / 60:
+                line += f" &nbsp;→&nbsp; <b>{duration(after)}</b>"
+            note = "acceleration not included"
+            if rp["moves"]:
+                note = ("rapid moves (full speed)" if rapid is None else "rapid moves in the 'before' time") + " and " + note
+            self.sp_summary.setText(f"{line}<br><span style='color:{muted}'>Estimate · {note}</span>")
+            self.sp_summary.setVisible(True)
+        else:
+            self.sp_summary.setVisible(False)
+
+        warns = []
+        laser = self.sp_laser.isChecked()
+        top = max((r["value"] for r in si["power"]), default=None)
+        if top is not None and any(v > top for v in power.values()):
+            warns.append(f"New S is above the highest S in the file ({num(top)}). "
+                         "GRBL caps S at its $30 setting, so it may have no effect.")
+        if rapid is not None and not laser:
+            warns.append("The spindle keeps running on the slowed rapid moves. Laser file? "
+                         "Select Laser so the beam is switched off (S0) on them.")
+        if si["no_feed"]:
+            warns.append(f"{si['no_feed']} feed move(s) come before any F value; they are left as they are.")
+        self.sp_warn.setText("\n".join("⚠  " + w for w in warns))
+        self.sp_warn.setVisible(bool(warns))
+
+    def apply_speed(self):
+        work, idle, power, rapid = self._speed_request()
+        laser = self.sp_laser.isChecked()
+        try:
+            new = apply_speeds(self.output, work, idle, power, rapid, laser)
+        except ValueError as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        parts = []
+        for name, m in (("work F", work), ("idle F", idle), ("S", power)):
+            if m:
+                items = [f"{num(a).replace(',', '')}→{num(b).replace(',', '')}" for a, b in sorted(m.items())]
+                parts.append(f"{name} " + (", ".join(items) if len(items) <= 2 else f"{len(items)} values"))
+        if rapid is not None:
+            parts.append(f"rapids → G1 F{num(rapid).replace(',', '')}")
+        unchanged = new == self.output
+        self.sp_rapid.setChecked(False)
+        for t in (self.t_work, self.t_idle, self.t_power):
+            t._rows = []  # forget edits: the new file has new "current" values
+        self.apply("Speed: " + "; ".join(parts), new)
+        if unchanged:
+            self._refresh_speed()
+
     # ---- analysis ----------------------------------------------------------- #
+    def speed_info(self, text):
+        key = ("speed", hash(text))
+        if key not in self._info_cache:
+            self._info_cache[key] = get_speed_info(text)
+        return self._info_cache[key]
+
     def info(self, text):
         key = hash(text)
         if key not in self._info_cache:
@@ -946,6 +1322,14 @@ class MainWindow(QMainWindow):
         self.z_none.setVisible(not has_z)
         self.z_body.setVisible(has_z)
         self._update_z()
+        if not self._tool_user_set:
+            laser = self.speed_info(self.output)["laser"]
+            for b in (self.sp_cnc, self.sp_laser):
+                b.blockSignals(True)
+            (self.sp_laser if laser else self.sp_cnc).setChecked(True)
+            for b in (self.sp_cnc, self.sp_laser):
+                b.blockSignals(False)
+        self._refresh_speed()
         self._redraw(refit=refit)
 
     def _refresh_history(self):
@@ -1221,6 +1605,10 @@ class MainWindow(QMainWindow):
             self.sc_pct.setChecked(True)
             self.sc_value.setValue(100.0)
             self._pos_focus = "place"
+            self._tool_user_set = False
+            self.sp_rapid.setChecked(False)
+            for t in (self.t_work, self.t_idle, self.t_power):
+                t._rows = []
             self.refresh(refit=True)
         finally:
             QApplication.restoreOverrideCursor()

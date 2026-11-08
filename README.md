@@ -17,6 +17,10 @@ module.
   before you click.
 - **Z (CNC only):** set the deepest cut, or move Z by an amount. Asks you to
   confirm first.
+- **Speed & power:** change the feed rate (`F`) separately for moves **while
+  working** (spindle running / laser on) and **while not working** (spindle
+  stopped / laser off). You can also slow down rapid moves, and change the
+  spindle speed or laser power (`S`). Shows an estimated time before and after.
 - **Undo / Redo / Reset,** a history list, a warning about unsaved changes,
   drag & drop, and light/dark theme following Windows.
 
@@ -59,7 +63,7 @@ python gcode_shifter.py "C:\path\to\job.nc"   # open a file straight away
 
 1. **Open:** drag a `.nc` / `.gcode` / `.ngc` / `.tap` file onto the window,
    or press **Ctrl+O**.
-2. **Adjust:** use the *Position*, *Scale* or *Z* tab. The green dashed box
+2. **Adjust:** use the *Position*, *Scale*, *Z depth* or *Speed & power* tab. The green dashed box
    and ◆ show the result before you click. The figures, preview and history
    update after every change.
 3. **Save:** press **Ctrl+S**. The first save asks for a name and suggests
@@ -90,8 +94,34 @@ lines, `$` commands, line endings and word order stay exactly as they were.
 | Relative moves (G91) | unchanged (correct: they are distances) | scaled |
 | Arc `I` `J` (always relative in GRBL) and `R` | unchanged | scaled |
 | Z | only from the Z tab | unchanged |
-| Feed `F`, spindle speed / laser power `S` | unchanged | unchanged |
+| Feed `F`, spindle speed / laser power `S` | unchanged (use *Speed & power*) | unchanged (use *Speed & power*) |
 | `G53`, `G28`/`G30`, `G92`, `G10`, `G43.1` lines | unchanged | unchanged |
+
+### Speed & power tab
+
+`F` is the **feed rate** (how fast the machine moves, in mm/min or in/min).
+`S` is the **spindle speed** (RPM) or the **laser power** (100% = GRBL `$30`).
+
+| Group | What it covers |
+|---|---|
+| Feed while working | `G1`/`G2`/`G3` moves with the spindle or laser on and `S` not 0 |
+| Speed while not working | `G1`/`G2`/`G3` moves with the tool off (after `M5`, or `S0`, e.g. laser overscan) |
+| Rapid moves (`G0`) | GRBL always runs these at maximum speed (`$110`/`$111`). Tick *Limit rapid moves to* to turn them into `G1` at your feed. With **Laser** selected those moves also get `S0`, so the beam stays off. With **CNC spindle** selected the spindle keeps running. |
+| Spindle speed / laser power | every non-zero `S` value. `S0` always stays 0. |
+
+Each group lists every distinct value in the file, with how many moves use it
+and what share of the distance. You can:
+
+- double-click **New** to change one value (for example only the plunge feed,
+  marked "↓ plunge"),
+- use **All values** to set every row to a percentage at once (useful for
+  laser raster files with hundreds of power levels),
+- or press **↺ Reset**.
+
+The same `F` can get different new values in *working* and *not working*.
+Because `F` and `S` are modal, the editor writes them again wherever the
+machine would otherwise keep using the wrong value. The tool type (CNC/laser)
+is detected (M4, or no Z moves, means laser) and you can change it.
 
 What counts as the **cut area** (used for positioning and scaling):
 feed moves (`G1`/`G2`/`G3`) with the spindle or laser on and `S` not 0.

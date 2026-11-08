@@ -17,6 +17,7 @@ GRBL semantics that matter here:
   * G43.1 Z         dynamic tool length offset, not a position.
   * M3/M4/M5, S     spindle / laser on-off and speed / power. A feed move
                     with S0 (laser overscan / travel) is not a "cut".
+  * F               feed rate, modal. G0 ignores it (always max rate $110/$111).
 """
 
 import hashlib
@@ -104,10 +105,17 @@ class _State:
         self.pos = {a: None for a in AXES}
         self.spindle_on = None  # None = never set in the file
         self.s = None
+        self.f = None
+        self.inverse_time = False  # G93
+        self.used_m4 = False
 
     def apply_modal(self, gcodes, mcodes, words):
         if mcodes & {"3", "4"}:
             self.spindle_on = True
+        if "4" in mcodes:
+            self.used_m4 = True
+        if "F" in words:
+            self.f = words["F"]
         if mcodes & {"5", "2", "30"}:
             self.spindle_on = False
         if "S" in words:
@@ -123,6 +131,10 @@ class _State:
                 self.units = "inch"
             elif g == "21":
                 self.units = "mm"
+            elif g == "93":
+                self.inverse_time = True
+            elif g == "94":
+                self.inverse_time = False
             elif g in MOTION_GCODES:
                 self.motion = g
 
@@ -318,6 +330,33 @@ def _arc_polyline(start, end, words, plane, clockwise, step_deg=10.0):
     return pts
 
 
+def _is_motion_line(gcodes, words, state):
+    """True if this block makes an ordinary work-coordinate move."""
+    return (
+        (any(a in words for a in AXES) or
+         (state.motion in {"2", "3"} and any(a in words for a in "IJK")))
+        and not gcodes & NO_SHIFT_GCODES
+        and state.motion not in (None, "80")
+    )
+
+
+def _is_cutting(state):
+    # A feed move only cuts/burns if the spindle/laser isn't explicitly off
+    # and S isn't 0 (laser files use G1 ... S0 for travel/overscan).
+    return state.motion in CUT_MOTIONS and state.spindle_on is not False and state.s != 0
+
+
+def _move_kind(gcodes, words, state):
+    """'rapid' (G0), 'work' (feed move, tool on), 'idle' (feed move, tool off) or None."""
+    if not _is_motion_line(gcodes, words, state):
+        return None
+    if state.motion == "0":
+        return "rapid"
+    if state.motion in CUT_MOTIONS:
+        return "work" if _is_cutting(state) else "idle"
+    return None  # probing
+
+
 def _simulate(gcode):
     """Yield (gcodes, state, move) per line; move is None for non-motion lines.
 
@@ -339,12 +378,7 @@ def _simulate(gcode):
             for a in AXES:
                 if a in words:
                     state.pos[a] = None
-        if (
-            (any(a in words for a in AXES) or
-             (state.motion in {"2", "3"} and any(a in words for a in "IJK")))
-            and not gcodes & NO_SHIFT_GCODES
-            and state.motion not in (None, "80")
-        ):
+        if _is_motion_line(gcodes, words, state):
             start = dict(state.pos)
             end = dict(start)
             for a in AXES:
@@ -355,14 +389,12 @@ def _simulate(gcode):
                         end[a] = start[a] + words[a]
                     else:
                         end[a] = None  # incremental from unknown position
-            # A feed move only cuts/burns if the spindle/laser isn't explicitly
-            # off and S isn't 0 (laser files use G1 ... S0 for travel/overscan).
-            cutting = state.motion in CUT_MOTIONS and state.spindle_on is not False and state.s != 0
             move = {
                 "start": start,
                 "end": end,
                 "words": words,
-                "cutting": cutting,
+                "kind": _move_kind(gcodes, words, state),
+                "cutting": _is_cutting(state),
                 "arc": {"2": "cw", "3": "ccw"}.get(state.motion),
             }
             state.pos = end
@@ -449,6 +481,211 @@ def get_toolpath(gcode):
         else:
             polylines.append((kind, [(s["X"], s["Y"])] + pts))
     return polylines
+
+
+# --------------------------------------------------------------------------- #
+# Feed rate (F) and spindle speed / laser power (S)
+# --------------------------------------------------------------------------- #
+_FS_RE = re.compile(r"([FSfs])(\s*)(" + _NUM + r")")
+_G0_RE = re.compile(r"([Gg])(\s*)(0+)(?:\.0*)?(?![\d.])")
+
+
+def _move_length(move, plane):
+    s, e = move["start"], move["end"]
+    if move["arc"]:
+        geo = _arc_geometry(s, e, move["words"], plane, move["arc"] == "cw")
+        if geo is not None:
+            lin = _PLANES[plane][2]
+            dl = e[lin] - s[lin] if None not in (s[lin], e[lin]) else 0.0
+            return math.hypot(geo[2] * geo[4], dl)
+    return math.sqrt(sum((e[a] - s[a]) ** 2 for a in AXES if None not in (s[a], e[a])))
+
+
+def get_speed_info(gcode):
+    """Usage of every feed rate and S value, grouped by what the machine is doing.
+
+    Returns {
+      "work":  [row, ...]   feed (F) values of feed moves with the tool ON,
+      "idle":  [row, ...]   feed (F) values of feed moves with the tool OFF / S0,
+      "power": [row, ...]   non-zero S values used by the cutting moves,
+      "rapids": {"moves", "length"}   G0 moves (always at the machine max rate),
+      "no_feed": int        feed moves before any F was set,
+      "inverse_time": bool  G93 used (feed editing is disabled),
+      "laser": bool         best guess: M4 used, or no Z moves at all,
+    }
+    row = {"value", "moves", "length", "plunges"}; rows sorted by value.
+    `length` is in file units; "plunges" counts Z-only moves.
+    """
+    groups = {"work": {}, "idle": {}, "power": {}}
+    rapids = {"moves": 0, "length": 0.0}
+    no_feed = 0
+    inverse_time = used_m4 = has_z = False
+
+    def add(group, value, length, plunge):
+        row = groups[group].setdefault(value, {"value": value, "moves": 0, "length": 0.0, "plunges": 0})
+        row["moves"] += 1
+        row["length"] += length
+        row["plunges"] += plunge
+
+    for _, state, move in _simulate(gcode):
+        inverse_time |= state.inverse_time
+        used_m4 |= state.used_m4
+        if move is None or move["kind"] is None:
+            continue
+        s, e = move["start"], move["end"]
+        if "Z" in move["words"]:
+            has_z = True
+        length = _move_length(move, state.plane)
+        if move["kind"] == "rapid":
+            rapids["moves"] += 1
+            rapids["length"] += length
+            continue
+        plunge = int(s["X"] == e["X"] and s["Y"] == e["Y"] and s["Z"] != e["Z"])
+        if state.f is None:
+            no_feed += 1
+        else:
+            add(move["kind"], state.f, length, plunge)
+        if move["kind"] == "work" and state.s is not None:
+            add("power", state.s, length, plunge)
+
+    return {
+        **{k: [v[key] for key in sorted(v)] for k, v in groups.items()},
+        "rapids": rapids,
+        "no_feed": no_feed,
+        "inverse_time": inverse_time,
+        "laser": used_m4 or not has_z,
+    }
+
+
+def _append_words(segments, new_words):
+    """Append words (e.g. ["F1000", "S0"]) after the last code of the line."""
+    for i in range(len(segments) - 1, -1, -1):
+        is_code, text = segments[i]
+        if is_code and text.strip():
+            core = text.rstrip()
+            sep = "" if re.search(r"\d[A-Za-z]", core) else " "  # keep "G1X10F800" style
+            segments[i] = (True, core + "".join(sep + w for w in new_words) + text[len(core):])
+            return segments
+    return segments
+
+
+def _prepend_word(segments, word):
+    for i, (is_code, text) in enumerate(segments):
+        if is_code and text.strip():
+            lead = text[: len(text) - len(text.lstrip())]
+            rest = text.lstrip()
+            sep = "" if re.search(r"\d[A-Za-z]", rest) else " "
+            segments[i] = (True, lead + word + sep + rest)
+            return segments
+    return segments
+
+
+def apply_speeds(gcode, work_feed=None, idle_feed=None, power=None, rapid_feed=None, laser=False):
+    """Change feed rates and S values.
+
+    work_feed / idle_feed: {old F: new F} for feed moves (G1/G2/G3) with the
+        tool on / off. The same F can be mapped differently in each group.
+    power: {old S: new S} applied to every non-zero S word.
+    rapid_feed: if set, G0 moves become G1 at this feed (G0 itself can't be
+        slowed down - it always runs at GRBL's $110/$111 max rate). With
+        `laser` True and the laser on, those moves also get S0 so nothing burns.
+        (Not done for a spindle: S0 would stop it.)
+
+    F and S are modal, so F/S words are re-emitted wherever the edited value
+    differs from what the machine would otherwise still be using. Everything
+    else in the file is left untouched.
+    """
+    work_feed, idle_feed, power = dict(work_feed or {}), dict(idle_feed or {}), dict(power or {})
+    for v in list(work_feed.values()) + list(idle_feed.values()) + ([rapid_feed] if rapid_feed is not None else []):
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("Feed rates must be greater than 0.")
+    for v in power.values():
+        if not math.isfinite(v) or v < 0:
+            raise ValueError("Spindle speed / laser power can't be negative.")
+    power.pop(0.0, None)  # S0 = off, always stays 0
+    changes_feed = any(k != v for k, v in list(work_feed.items()) + list(idle_feed.items())) or rapid_feed is not None
+
+    # Kind of the next feed move after each line, so a stand-alone "F3000" line
+    # gets the value of the move it is setting up (avoids redundant F words).
+    kinds = [_move_kind(g, w, st) for _, _, _, g, w, st in _walk(gcode)]
+    next_feed = [None] * (len(kinds) + 1)
+    for i in range(len(kinds) - 1, -1, -1):
+        next_feed[i] = kinds[i] if kinds[i] in ("work", "idle") else next_feed[i + 1]
+
+    out = []
+    out_f = out_s = out_motion = None  # what the machine uses after the edited lines
+    for idx, (body, ending, segments, gcodes, words, state) in enumerate(_walk(gcode)):
+        if state.inverse_time and changes_feed:
+            raise ValueError("This file uses inverse-time feed (G93); feed rates can't be edited.")
+        kind = _move_kind(gcodes, words, state)
+        convert = kind == "rapid" and rapid_feed is not None
+        feed_line = kind in ("work", "idle") or convert
+        laser_off = convert and laser and state.spindle_on is not False
+
+        desired_f = desired_s = None
+        if feed_line:
+            if convert:
+                desired_f = rapid_feed
+            elif state.f is not None:
+                desired_f = (work_feed if kind == "work" else idle_feed).get(state.f, state.f)
+            if laser_off:
+                desired_s = 0.0
+            elif state.s is not None:
+                desired_s = power.get(state.s, state.s)
+
+        line_f = line_s = None
+
+        def repl(m):
+            nonlocal line_f, line_s
+            letter, value = m.group(1).upper(), float(m.group(3))
+            if letter == "F":
+                if feed_line:
+                    new = desired_f if desired_f is not None else value
+                elif kind is None and next_feed[idx]:  # F on a line that doesn't move
+                    new = (work_feed if next_feed[idx] == "work" else idle_feed).get(value, value)
+                else:
+                    new = value
+                line_f = new
+            else:
+                new = 0.0 if laser_off else power.get(value, value)
+                line_s = new
+            return m.group(0) if new == value else f"{m.group(1)}{m.group(2)}{_fmt(new)}"
+
+        segs = [(c, _FS_RE.sub(repl, t) if c else t) for c, t in segments]
+
+        if convert:
+            replaced = False
+
+            def g0(m):
+                nonlocal replaced
+                replaced = True
+                return f"{m.group(1)}{m.group(2)}{'0' * (len(m.group(3)) - 1)}1"
+
+            segs = [(c, _G0_RE.sub(g0, t) if c else t) for c, t in segs]
+            if not replaced and out_motion != "1":
+                segs = _prepend_word(segs, "G1")
+
+        extra = []
+        if feed_line and line_f is None and desired_f is not None and desired_f != out_f:
+            extra.append("F" + _fmt(desired_f))
+            line_f = desired_f
+        if feed_line and line_s is None and desired_s is not None and desired_s != out_s:
+            extra.append("S" + _fmt(desired_s))
+            line_s = desired_s
+        if extra:
+            segs = _append_words(segs, extra)
+
+        if line_f is not None:
+            out_f = line_f
+        if line_s is not None:
+            out_s = line_s
+        if convert:
+            out_motion = "1"
+        elif gcodes & MOTION_GCODES:
+            out_motion = state.motion
+        out.append("".join(t for _, t in segs) + ending)
+
+    return "".join(out)
 
 
 def alignment_box(info):

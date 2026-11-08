@@ -185,3 +185,87 @@ def test_scale_preserves_numbers_that_do_not_change():
     g = "G0 X1.123456 Y0.00000\nG2 X2.123456 I0.500000 J0.00000\n"
     assert scale_gcode(g, 1) == g
     assert "Y0.00000" in scale_gcode(g, 2)
+
+
+# --------------------------------------------------------------------------- #
+# Feed rate / power
+# --------------------------------------------------------------------------- #
+from utils import apply_speeds, get_speed_info  # noqa: E402
+
+CNC_FEEDS = """G90 G21
+M3 S12000
+G0 Z5
+G0 X0 Y0
+G1 Z-1 F300
+G1 X10 F800 ; cut
+X20
+G0 Z5
+M5
+G1 X0 Y0 F800
+"""
+
+
+def test_speed_info_groups_work_idle_rapid_and_power():
+    info = get_speed_info(CNC_FEEDS)
+    work = {r["value"]: r for r in info["work"]}
+    assert set(work) == {300, 800}
+    assert work[300]["plunges"] == 1 and work[800]["moves"] == 2
+    assert math.isclose(work[800]["length"], 20)
+    assert [r["value"] for r in info["idle"]] == [800]
+    assert info["rapids"]["moves"] == 3
+    assert [r["value"] for r in info["power"]] == [12000]
+    assert not info["laser"]
+
+
+def test_same_feed_mapped_differently_when_working_and_idle():
+    out = apply_speeds(CNC_FEEDS, work_feed={800: 1000}).splitlines()
+    assert out[5] == "G1 X10 F1000 ; cut"
+    assert out[6] == "X20"                       # modal - already 1000
+    assert out[9] == "G1 X0 Y0 F800"             # idle move keeps 800
+    out = apply_speeds(CNC_FEEDS, idle_feed={800: 2000}).splitlines()
+    assert out[5] == "G1 X10 F800 ; cut" and out[9] == "G1 X0 Y0 F2000"
+
+
+def test_modal_feed_is_reemitted_when_switching_between_work_and_idle():
+    g = "M4 S0\nG0 X0 Y0\nG1 X5 F3000 S0\nG1 X10 S500\nG1 X15 S0\n"
+    out = apply_speeds(g, work_feed={3000: 1500}).splitlines()
+    assert out[2] == "G1 X5 F3000 S0"
+    assert out[3] == "G1 X10 S500 F1500"
+    assert out[4] == "G1 X15 S0 F3000"
+    assert get_speed_info("\n".join(out))["work"][0]["value"] == 1500
+
+
+def test_power_map_and_no_change_is_identity():
+    g = "M3 S1000\nG1X1F100S800\nG1 X2 S0\n"
+    assert apply_speeds(g) == g
+    assert apply_speeds(g, power={1000: 500, 800: 400, 0: 50}) == "M3 S500\nG1X1F100S400\nG1 X2 S0\n"
+
+
+def test_rapid_limit_laser_turns_beam_off_and_restores():
+    g = "M4 S500 F1000\nG0 X10\nG1 X20\nG00 X0\n"
+    out = apply_speeds(g, rapid_feed=3000, laser=True)
+    assert out == "M4 S500 F1000\nG1 X10 F3000 S0\nG1 X20 F1000 S500\nG01 X0 F3000 S0\n"
+
+
+def test_rapid_limit_cnc_keeps_spindle_and_handles_modal_g0():
+    g = "M3 S9000\nG0 Z5\nX10 Y10\nG53 G0 Z-1\nX0\nG1 Z-1 F200\n"
+    out = apply_speeds(g, rapid_feed=2000, laser=False).splitlines()
+    assert out[1] == "G1 Z5 F2000"
+    assert out[2] == "X10 Y10"                   # modal, already G1 at F2000
+    assert out[3] == "G53 G0 Z-1"                # machine move untouched
+    assert out[4] == "G1 X0"                     # modal G0 again -> needs G1
+    assert out[5] == "G1 Z-1 F200"
+
+
+def test_speeds_reject_bad_values_and_inverse_time():
+    assert _raises(lambda: apply_speeds("G1 X1 F100", work_feed={100: 0}))
+    assert _raises(lambda: apply_speeds("G1 X1 F100", power={100: -1}))
+    assert _raises(lambda: apply_speeds("G93 G1 X1 F2", work_feed={2: 3}))
+
+
+def test_standalone_feed_line_takes_value_of_the_next_move():
+    g = "M3 S1000\nG1 F3000.000\nG3 X10 Y0 I5 J0\nG1 X20 S0\n"
+    out = apply_speeds(g, work_feed={3000: 2400}).splitlines()
+    assert out[1] == "G1 F2400"
+    assert out[2] == "G3 X10 Y0 I5 J0"           # no redundant F
+    assert out[3] == "G1 X20 S0 F3000"           # idle move restores its own feed
