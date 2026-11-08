@@ -189,13 +189,16 @@ def scale_gcode(gcode, factor, ref_x=0.0, ref_y=0.0):
     Raises ValueError for factor <= 0 or for arcs in the G18/G19 planes (those
     mix Z into the arc, which can't be scaled while keeping Z unchanged).
     """
-    if factor <= 0:
+    if not math.isfinite(factor) or factor <= 0:
         raise ValueError("Scale factor must be greater than 0.")
     refs = {"X": ref_x, "Y": ref_y}
     out = []
 
     for body, ending, segments, gcodes, words, state in _walk(gcode):
-        if gcodes & NO_SHIFT_GCODES or not any(k in words for k in "XYIJR"):
+        if gcodes & NO_SHIFT_GCODES:
+            out.append(body + ending)
+            continue
+        if not any(k in words for k in "XYZIJKR"):
             out.append(body + ending)
             continue
         is_arc = state.motion in ("2", "3")
@@ -213,6 +216,8 @@ def scale_gcode(gcode, factor, ref_x=0.0, ref_y=0.0):
             elif is_arc:  # I, J, R only mean something on arc moves
                 new = value * factor
             else:
+                return m.group(0)
+            if new == value:
                 return m.group(0)
             return f"{m.group(1)}{m.group(2)}{_fmt(new)}"
 
@@ -320,8 +325,23 @@ def _simulate(gcode):
     """
     for _, _, _, gcodes, words, state in _walk(gcode):
         move = None
+        # These blocks change the work-coordinate position without an ordinary
+        # work move. Never connect subsequent paths to the stale position.
+        if "92" in gcodes:
+            for a in AXES:
+                if a in words:
+                    state.pos[a] = words[a]
+        elif gcodes & {"10", "92.1", "43.1", "49", "54", "55", "56", "57", "58", "59"}:
+            state.pos = dict.fromkeys(AXES)
+        elif gcodes & {"28", "30"}:
+            state.pos = dict.fromkeys(AXES)
+        elif "53" in gcodes:
+            for a in AXES:
+                if a in words:
+                    state.pos[a] = None
         if (
-            any(a in words for a in AXES)
+            (any(a in words for a in AXES) or
+             (state.motion in {"2", "3"} and any(a in words for a in "IJK")))
             and not gcodes & NO_SHIFT_GCODES
             and state.motion not in (None, "80")
         ):
@@ -364,7 +384,8 @@ def get_gcode_info(gcode):
     has_g18_19_arcs = False
 
     for gcodes, state, move in _simulate(gcode):
-        units_seen.add(state.units)
+        if move is not None or gcodes & {"20", "21"}:
+            units_seen.add(state.units)
         if "92" in gcodes:
             notices.add(("info", "Uses G92 coordinate offsets - those lines are kept as-is."))
         if gcodes & {"53", "28", "30"}:
