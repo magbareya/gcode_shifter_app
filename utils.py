@@ -1,9 +1,9 @@
-"""G-code helpers for shifting a toolpath and measuring its extents.
+"""G-code helpers: shift, scale, measure and preview a toolpath.
 
-Written for GRBL 1.1 (e.g. TwoTrees TTC450 Pro). The parser only rewrites the
-numeric value of X/Y/Z words in place; everything else (comments, spacing,
-`%` lines, `$` commands, word order, number formatting of untouched words)
-is preserved byte-for-byte.
+Written for GRBL 1.1 (e.g. TwoTrees TTC450 Pro, router or laser module). The
+editor only rewrites the numeric value of the words it changes; everything
+else (comments, spacing, `%` lines, `$` commands, word order, formatting of
+untouched numbers) is preserved byte-for-byte.
 
 GRBL semantics that matter here:
   * G90 / G91       absolute vs incremental distance mode (modal). Only
@@ -15,6 +15,8 @@ GRBL semantics that matter here:
   * G10 / G92       define coordinate systems - shifting their values would
                     cancel (or double) the intended shift.
   * G43.1 Z         dynamic tool length offset, not a position.
+  * M3/M4/M5, S     spindle / laser on-off and speed / power. A feed move
+                    with S0 (laser overscan / travel) is not a "cut".
 """
 
 import hashlib
@@ -30,6 +32,7 @@ MACHINE_TRAVEL_MM = {"X": 460.0, "Y": 460.0, "Z": 80.0}
 _NUM = r"[+-]?(?:\d+\.?\d*|\.\d+)"
 _WORD_RE = re.compile(r"([A-Za-z])\s*(" + _NUM + r")")
 _AXIS_RE = re.compile(r"([XYZxyz])(\s*)(" + _NUM + r")")
+_SCALE_RE = re.compile(r"([XYIJRxyijr])(\s*)(" + _NUM + r")")
 _COMMENT_RE = re.compile(r"\([^)]*\)?|;.*")
 
 # G-codes whose X/Y/Z words are NOT work-coordinate targets.
@@ -76,11 +79,8 @@ def _norm_code(value):
 
 
 def _parse_words(segments):
-    """Return (gcodes:set[str], words:dict[letter->float]) for a block.
-
-    M-codes are returned in `words` under the key "M*" as a set.
-    """
-    gcodes, words, mcodes = set(), {}, set()
+    """Return (gcodes, mcodes, words) for a block; words maps letter -> float."""
+    gcodes, mcodes, words = set(), set(), {}
     for is_code, text in segments:
         if not is_code:
             continue
@@ -92,8 +92,7 @@ def _parse_words(segments):
                 mcodes.add(_norm_code(value))
             else:
                 words[letter] = float(value)
-    words["M*"] = mcodes
-    return gcodes, words
+    return gcodes, mcodes, words
 
 
 class _State:
@@ -106,8 +105,7 @@ class _State:
         self.spindle_on = None  # None = never set in the file
         self.s = None
 
-    def apply_modal(self, gcodes, words):
-        mcodes = words.get("M*", set())
+    def apply_modal(self, gcodes, mcodes, words):
         if mcodes & {"3", "4"}:
             self.spindle_on = True
         if mcodes & {"5", "2", "30"}:
@@ -140,19 +138,23 @@ def _walk(gcode):
     for raw in gcode.splitlines(keepends=True):
         body, ending = _split_line_ending(raw)
         segments = _code_segments(body)
-        gcodes, words = _parse_words(segments)
-        state.apply_modal(gcodes, words)
+        gcodes, mcodes, words = _parse_words(segments)
+        state.apply_modal(gcodes, mcodes, words)
         yield body, ending, segments, gcodes, words, state
 
 
-# --------------------------------------------------------------------------- #
-# Shifting
-# --------------------------------------------------------------------------- #
 def _fmt(value, decimals=4):
     s = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
     return "0" if s in ("", "-0") else s
 
 
+def _rewrite(segments, pattern, repl):
+    return "".join(pattern.sub(repl, text) if is_code else text for is_code, text in segments)
+
+
+# --------------------------------------------------------------------------- #
+# Transformations
+# --------------------------------------------------------------------------- #
 def shift_gcode(gcode, x_shift=0.0, y_shift=0.0, z_shift=0.0):
     """Translate all absolute work-coordinate X/Y/Z targets by the given offsets."""
     shifts = {"X": x_shift, "Y": y_shift, "Z": z_shift}
@@ -170,15 +172,9 @@ def shift_gcode(gcode, x_shift=0.0, y_shift=0.0, z_shift=0.0):
                 return m.group(0)
             return f"{m.group(1)}{m.group(2)}{_fmt(float(m.group(3)) + delta)}"
 
-        new_body = "".join(
-            _AXIS_RE.sub(repl, text) if is_code else text for is_code, text in segments
-        )
-        out.append(new_body + ending)
+        out.append(_rewrite(segments, _AXIS_RE, repl) + ending)
 
     return "".join(out)
-
-
-_SCALE_RE = re.compile(r"([XYIJRxyijr])(\s*)(" + _NUM + r")")
 
 
 def scale_gcode(gcode, factor, ref_x=0.0, ref_y=0.0):
@@ -210,23 +206,23 @@ def scale_gcode(gcode, factor, ref_x=0.0, ref_y=0.0):
             letter = m.group(1).upper()
             value = float(m.group(3))
             if letter in "XY":
-                new = (value - refs[letter]) * factor + refs[letter] if state.absolute else value * factor
+                if state.absolute:
+                    new = (value - refs[letter]) * factor + refs[letter]
+                else:
+                    new = value * factor
             elif is_arc:  # I, J, R only mean something on arc moves
                 new = value * factor
             else:
                 return m.group(0)
             return f"{m.group(1)}{m.group(2)}{_fmt(new)}"
 
-        new_body = "".join(
-            _SCALE_RE.sub(repl, text) if is_code else text for is_code, text in segments
-        )
-        out.append(new_body + ending)
+        out.append(_rewrite(segments, _SCALE_RE, repl) + ending)
 
     return "".join(out)
 
 
 # --------------------------------------------------------------------------- #
-# Extents
+# Simulation (extents + preview)
 # --------------------------------------------------------------------------- #
 class _Box:
     def __init__(self):
@@ -254,22 +250,21 @@ class _Box:
         return {"min": dict(self.min), "max": dict(self.max), "mid": mid, "size": size}
 
 
-def _arc_points(start, end, words, plane, clockwise):
-    """Return extra points (axis extremes) that an arc passes through."""
+def _arc_geometry(start, end, words, plane, clockwise):
+    """Return (cu, cv, radius, start_angle, sweep, a0, a1) or None."""
     a0, a1, _, off0, off1 = _PLANES[plane]
-    if start[a0] is None or start[a1] is None:
-        return []
+    if None in (start[a0], start[a1], end[a0], end[a1]):
+        return None
     su, sv = start[a0], start[a1]
     eu, ev = end[a0], end[a1]
 
-    if "R" in words:
+    if "R" in words:  # same centre calculation GRBL uses (gcode.c)
         r = words["R"]
         x, y = eu - su, ev - sv
         d = math.hypot(x, y)
         if d == 0:
-            return []
-        h = 4 * r * r - x * x - y * y
-        h = -math.sqrt(max(h, 0.0)) / d
+            return None
+        h = -math.sqrt(max(4 * r * r - x * x - y * y, 0.0)) / d
         if not clockwise:
             h = -h
         if r < 0:
@@ -281,100 +276,162 @@ def _arc_points(start, end, words, plane, clockwise):
     radius = math.hypot(su - cu, sv - cv)
     ang_s = math.atan2(sv - cv, su - cu)
     ang_e = math.atan2(ev - cv, eu - cu)
-    two_pi = 2 * math.pi
-    sweep = ((ang_s - ang_e) if clockwise else (ang_e - ang_s)) % two_pi
+    sweep = ((ang_s - ang_e) if clockwise else (ang_e - ang_s)) % (2 * math.pi)
     if sweep < 1e-9 and "R" not in words:
-        sweep = two_pi  # full circle
+        sweep = 2 * math.pi  # full circle
+    return cu, cv, radius, ang_s, sweep, a0, a1
 
+
+def _arc_extremes(start, end, words, plane, clockwise):
+    """Axis-extreme points (0/90/180/270 deg) that an arc passes through."""
+    geo = _arc_geometry(start, end, words, plane, clockwise)
+    if geo is None:
+        return []
+    cu, cv, radius, ang_s, sweep, a0, a1 = geo
     points = []
     for k in range(4):
         theta = k * math.pi / 2
-        delta = ((ang_s - theta) if clockwise else (theta - ang_s)) % two_pi
+        delta = ((ang_s - theta) if clockwise else (theta - ang_s)) % (2 * math.pi)
         if delta <= sweep:
             points.append({a0: cu + radius * math.cos(theta), a1: cv + radius * math.sin(theta)})
     return points
 
 
-def get_gcode_info(gcode):
-    """Simulate the program and return extents, units and warnings.
+def _arc_polyline(start, end, words, plane, clockwise, step_deg=10.0):
+    """XY points along an arc, excluding the start point."""
+    geo = _arc_geometry(start, end, words, plane, clockwise)
+    if geo is None or plane != "17":
+        return [(end["X"], end["Y"])]
+    cu, cv, radius, ang_s, sweep, _, _ = geo
+    n = max(2, int(math.degrees(sweep) / step_deg) + 1)
+    sign = -1 if clockwise else 1
+    pts = [
+        (cu + radius * math.cos(ang_s + sign * sweep * i / n), cv + radius * math.sin(ang_s + sign * sweep * i / n))
+        for i in range(1, n)
+    ]
+    pts.append((end["X"], end["Y"]))
+    return pts
 
-    Returns {"units", "cut": box, "all": box, "warnings": [...]}, where `cut`
-    covers feed moves (G1/G2/G3) with the spindle/laser on and S != 0 - i.e.
-    the actual cut/engraved "image" - and `all` includes every move (rapids,
-    laser-off travel, overscan). Each box
-    is {"min","max","mid","size"} with X/Y/Z keys (None if never used).
+
+def _simulate(gcode):
+    """Yield (gcodes, state, move) per line; move is None for non-motion lines.
+
+    move = {"start", "end", "words", "cutting", "arc": None | "cw" | "ccw"}
+    """
+    for _, _, _, gcodes, words, state in _walk(gcode):
+        move = None
+        if (
+            any(a in words for a in AXES)
+            and not gcodes & NO_SHIFT_GCODES
+            and state.motion not in (None, "80")
+        ):
+            start = dict(state.pos)
+            end = dict(start)
+            for a in AXES:
+                if a in words:
+                    if state.absolute:
+                        end[a] = words[a]
+                    elif start[a] is not None:
+                        end[a] = start[a] + words[a]
+                    else:
+                        end[a] = None  # incremental from unknown position
+            # A feed move only cuts/burns if the spindle/laser isn't explicitly
+            # off and S isn't 0 (laser files use G1 ... S0 for travel/overscan).
+            cutting = state.motion in CUT_MOTIONS and state.spindle_on is not False and state.s != 0
+            move = {
+                "start": start,
+                "end": end,
+                "words": words,
+                "cutting": cutting,
+                "arc": {"2": "cw", "3": "ccw"}.get(state.motion),
+            }
+            state.pos = end
+        yield gcodes, state, move
+
+
+def get_gcode_info(gcode):
+    """Simulate the program and return extents, units and notices.
+
+    Returns {"units", "cut", "all", "can_scale", "notices": [(level, text)]}.
+    `cut` covers feed moves with the spindle/laser on and S != 0 - the actual
+    cut/engraved "image". `all` includes every move (rapids, laser-off
+    travel, overscan). Each box is {"min","max","mid","size"} with X/Y/Z keys
+    (None if the axis is never used).
     """
     cut, every = _Box(), _Box()
-    warnings = set()
+    notices = set()
     units_seen = set()
-    state = None
+    has_g18_19_arcs = False
 
-    for _, _, _, gcodes, words, state in _walk(gcode):
+    for gcodes, state, move in _simulate(gcode):
         units_seen.add(state.units)
-        if "91" in gcodes:
-            warnings.add("Program uses G91 (incremental) moves - those are not shifted, which is correct.")
         if "92" in gcodes:
-            warnings.add("Program uses G92 (coordinate offset) - its values are left untouched.")
+            notices.add(("info", "Uses G92 coordinate offsets - those lines are kept as-is."))
         if gcodes & {"53", "28", "30"}:
-            warnings.add("Program contains G53/G28/G30 moves - they are machine/safety moves and are not shifted or measured.")
-
-        if not any(a in words for a in AXES) or gcodes & NO_SHIFT_GCODES:
+            notices.add(("info", "Contains machine/safety moves (G53/G28/G30) - kept as-is and not measured."))
+        if move is None:
             continue
-        if state.motion in (None, "80"):
-            continue
-
-        start = dict(state.pos)
-        end = dict(start)
-        for a in AXES:
-            if a in words:
-                if state.absolute:
-                    end[a] = words[a]
-                elif start[a] is not None:
-                    end[a] = start[a] + words[a]
-                else:
-                    end[a] = None  # incremental from unknown position
-
-        # A feed move only "cuts/burns" if the spindle/laser is not explicitly
-        # off and S is not 0 (laser files use G1 ... S0 for travel/overscan).
-        cutting = (
-            state.motion in CUT_MOTIONS
-            and state.spindle_on is not False
-            and state.s != 0
-        )
-        boxes = [every] + ([cut] if cutting else [])
-        for box in boxes:
-            if cutting:
-                box.add_point(start)
-            box.add_point(end)
-            if state.motion in ("2", "3"):
-                for p in _arc_points(start, end, words, state.plane, state.motion == "2"):
+        if move["arc"] and state.plane != "17":
+            has_g18_19_arcs = True
+        for box in [every] + ([cut] if move["cutting"] else []):
+            if move["cutting"]:
+                box.add_point(move["start"])
+            box.add_point(move["end"])
+            if move["arc"]:
+                for p in _arc_extremes(move["start"], move["end"], move["words"], state.plane, move["arc"] == "cw"):
                     box.add_point(p)
 
-        state.pos = end
-
-    units = "inch" if "inch" in units_seen and len(units_seen) == 1 else "mm"
+    units = "inch" if units_seen == {"inch"} else "mm"
     if len(units_seen) > 1:
-        warnings.add("Program switches between G20 (inch) and G21 (mm) - extents may be wrong.")
+        notices.add(("warning", "Switches between inch (G20) and mm (G21) - sizes may be wrong."))
     elif units == "inch":
-        warnings.add("Program is in inches (G20) - all values and shifts are in inches.")
+        notices.add(("info", "File is in inches (G20) - all values you enter are in inches."))
+    if has_g18_19_arcs:
+        notices.add(("warning", "Has arcs in the XZ/YZ planes (G18/G19) - scaling is disabled for this file."))
 
-    info = {"units": units, "cut": cut.to_dict(), "all": every.to_dict()}
+    info = {"units": units, "cut": cut.to_dict(), "all": every.to_dict(), "can_scale": not has_g18_19_arcs}
 
-    scale = 25.4 if units == "inch" else 1.0
+    to_mm = 25.4 if units == "inch" else 1.0
     for a in AXES:
         size = info["all"]["size"][a]
-        if size is not None and size * scale > MACHINE_TRAVEL_MM[a]:
-            warnings.add(
-                f"{a} extent {size * scale:.1f} mm is larger than the TTC450 travel "
-                f"({MACHINE_TRAVEL_MM[a]:.0f} mm)."
-            )
+        if size is not None and size * to_mm > MACHINE_TRAVEL_MM[a]:
+            notices.add((
+                "warning",
+                f"{a} travel is {size * to_mm:.1f} mm - more than the TTC450's {MACHINE_TRAVEL_MM[a]:.0f} mm.",
+            ))
 
-    info["warnings"] = sorted(warnings)
+    info["notices"] = sorted(notices, key=lambda n: (n[0] != "warning", n[1]))
     return info
 
 
+def get_toolpath(gcode):
+    """XY polylines for previewing: [(kind, [(x, y), ...]), ...].
+
+    kind is "cut" (tool on, feed move) or "travel" (rapids / laser-off moves).
+    """
+    polylines = []
+    for _, state, move in _simulate(gcode):
+        if move is None:
+            continue
+        s, e = move["start"], move["end"]
+        if None in (s["X"], s["Y"], e["X"], e["Y"]):
+            continue
+        if move["arc"]:
+            pts = _arc_polyline(s, e, move["words"], state.plane, move["arc"] == "cw")
+        elif (s["X"], s["Y"]) == (e["X"], e["Y"]):
+            continue  # Z-only move
+        else:
+            pts = [(e["X"], e["Y"])]
+        kind = "cut" if move["cutting"] else "travel"
+        if polylines and polylines[-1][0] == kind and polylines[-1][1][-1] == (s["X"], s["Y"]):
+            polylines[-1][1].extend(pts)
+        else:
+            polylines.append((kind, [(s["X"], s["Y"])] + pts))
+    return polylines
+
+
 def alignment_box(info):
-    """Box used for Move/Set operations: feed moves if any, else all moves."""
+    """Box used for positioning/scaling: the cut area if any, else all moves."""
     if info["cut"]["min"]["X"] is not None or info["cut"]["min"]["Y"] is not None:
         return info["cut"]
     return info["all"]

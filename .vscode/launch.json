@@ -9,7 +9,7 @@
             "module": "streamlit",
             "args": [
                 "run",
-                "${file}",
+                "gcode_processor.py",
                 "--server.port",
                 "8501",
             ],

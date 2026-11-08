@@ -1,2 +1,6 @@
-streamlit>=1.30
-pandas
+# Tested with streamlit 1.67, altair 6.3, pandas 3.1, protobuf 7.36 (Python 3.12).
+streamlit>=1.60,<2
+altair>=5
+pandas>=2
+# protobuf 5.28.0's C extension corrupts memory on Windows and crashes Streamlit widgets.
+protobuf>=5.29,!=5.28.0
